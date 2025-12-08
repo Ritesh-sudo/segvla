@@ -28,6 +28,7 @@ import numpy as np
 import packaging.version
 import pandas
 import pandas as pd
+import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import torch
 from datasets import Dataset
@@ -48,7 +49,7 @@ from lerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_strin
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
 DEFAULT_DATA_FILE_SIZE_IN_MB = 100  # Max size per file
-DEFAULT_VIDEO_FILE_SIZE_IN_MB = 500  # Max size per file
+DEFAULT_VIDEO_FILE_SIZE_IN_MB = 200  # Max size per file
 
 INFO_PATH = "meta/info.json"
 STATS_PATH = "meta/stats.json"
@@ -103,7 +104,9 @@ def update_chunk_file_indices(chunk_idx: int, file_idx: int, chunks_size: int) -
     return chunk_idx, file_idx
 
 
-def load_nested_dataset(pq_dir: Path, features: datasets.Features | None = None) -> Dataset:
+def load_nested_dataset(
+    pq_dir: Path, features: datasets.Features | None = None, episodes: list[int] | None = None
+) -> Dataset:
     """Find parquet files in provided directory {pq_dir}/chunk-xxx/file-xxx.parquet
     Convert parquet files to pyarrow memory mapped in a cache folder for efficient RAM usage
     Concatenate all pyarrow references to return HF Dataset format
@@ -111,15 +114,26 @@ def load_nested_dataset(pq_dir: Path, features: datasets.Features | None = None)
     Args:
         pq_dir: Directory containing parquet files
         features: Optional features schema to ensure consistent loading of complex types like images
+        episodes: Optional list of episode indices to filter. Uses PyArrow predicate pushdown for efficiency.
     """
     paths = sorted(pq_dir.glob("*/*.parquet"))
     if len(paths) == 0:
         raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
 
-    # TODO(rcadene): set num_proc to accelerate conversion to pyarrow
     with SuppressProgressBars():
-        datasets = Dataset.from_parquet([str(path) for path in paths], features=features)
-    return datasets
+        # When no filtering needed, Dataset uses memory-mapped loading for efficiency
+        # PyArrow loads the entire dataset into memory
+        if episodes is None:
+            return Dataset.from_parquet([str(path) for path in paths], features=features)
+
+        arrow_dataset = pa_ds.dataset(paths, format="parquet")
+        filter_expr = pa_ds.field("episode_index").isin(episodes)
+        table = arrow_dataset.to_table(filter=filter_expr)
+
+        if features is not None:
+            table = table.cast(features.arrow_schema)
+
+        return Dataset(table)
 
 
 def get_parquet_num_frames(parquet_path: str | Path) -> int:
@@ -416,6 +430,21 @@ def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[to
             items_dict[key] = [to_tensor(img) for img in items_dict[key]]
         elif first_item is None:
             pass
+        elif "_segmentation" in key and isinstance(first_item, dict):
+            # Handle segmentation data stored as raw bytes
+            # Format: {'bytes': <raw_uint8_bytes>, 'path': <str>, 'shape': [H, W]}
+            import numpy as np
+            decoded_segs = []
+            for item in items_dict[key]:
+                if isinstance(item, dict) and 'bytes' in item and 'shape' in item:
+                    raw_bytes = item['bytes']
+                    shape = tuple(item['shape'])
+                    seg_array = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(shape)
+                    decoded_segs.append(torch.from_numpy(seg_array))
+                else:
+                    # Fallback: if not in expected format, try to convert as-is
+                    decoded_segs.append(torch.tensor(item))
+            items_dict[key] = decoded_segs
         else:
             items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
     return items_dict
@@ -566,6 +595,14 @@ def get_hf_features_from_features(features: dict) -> datasets.Features:
             continue
         elif ft["dtype"] == "image":
             hf_features[key] = datasets.Image()
+        elif ft["dtype"] == "binary":
+            # Handle segmentation data stored as binary with metadata
+            # Format: struct<bytes: binary, path: string, shape: list<int64>>
+            hf_features[key] = {
+                'bytes': datasets.Value('binary'),
+                'path': datasets.Value('string'),
+                'shape': datasets.Sequence(datasets.Value('int64'))
+            }
         elif ft["shape"] == (1,):
             hf_features[key] = datasets.Value(dtype=ft["dtype"])
         elif len(ft["shape"]) == 1:

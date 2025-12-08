@@ -18,11 +18,10 @@ from .groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi05.configuration_pi05 import PI05Config as PI05Config
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
-from .segvla.configuration_segvla import SegVLAConfig as SegVLAConfig
 from .smolvla.processor_smolvla import SmolVLANewLineProcessor
-from .segvla.processor_segvla import SegVLANewLineProcessor
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
+from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 
 __all__ = [
     "ACTConfig",
@@ -30,8 +29,8 @@ __all__ = [
     "PI0Config",
     "PI05Config",
     "SmolVLAConfig",
-    "SegVLAConfig",
     "TDMPCConfig",
     "VQBeTConfig",
     "GrootConfig",
+    "XVLAConfig",
 ]

@@ -34,6 +34,7 @@ lerobot[kinematics]
 lerobot[intelrealsense]
 lerobot[pi]
 lerobot[smolvla]
+lerobot[xvla]
 lerobot[hilserl]
 lerobot[async]
 lerobot[dev]
@@ -114,7 +115,7 @@ pyzmq<28.0.0,>=26.2.1
 
 [libero]
 lerobot[transformers-dep]
-libero@ git+https://github.com/huggingface/lerobot-libero.git@main#egg=libero
+hf-libero<0.2.0,>=0.1.3
 
 [metaworld]
 metaworld==3.0.0
@@ -157,6 +158,13 @@ mock-serial<0.1.0,>=0.0.1
 [transformers-dep]
 transformers<5.0.0,>=4.53.0
 
+[unitree_g1]
+pyzmq<28.0.0,>=26.2.1
+onnxruntime>=1.16.0
+
 [video_benchmark]
 scikit-image<0.26.0,>=0.23.2
 pandas<2.4.0,>=2.2.2
+
+[xvla]
+lerobot[transformers-dep]

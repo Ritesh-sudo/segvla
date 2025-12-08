@@ -20,6 +20,7 @@ from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 
@@ -46,26 +47,13 @@ class SegVLAConfig(PreTrainedConfig):
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
+    # Segmentation adapter configuration
+    use_segmentation_adapter: bool = True
+    num_segmentation_classes: int = 150
+
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
-
-    # Semantic segmentation integration
-    segmentation_feature_map: dict[str, str] = field(default_factory=dict)
-    segmentation_num_classes: int = 150
-    segmentation_top_k_classes: int = 10
-    segmentation_max_tokens: int = 16
-    segmentation_region_specs: tuple[tuple[float, float, float, float], ...] = (
-        (0.0, 0.5, 0.0, 0.5),  # top-left
-        (0.5, 1.0, 0.0, 0.5),  # top-right
-        (0.0, 0.5, 0.5, 1.0),  # bottom-left
-        (0.5, 1.0, 0.5, 1.0),  # bottom-right
-        (0.25, 0.75, 0.25, 0.75),  # center
-    )
-    segmentation_task_class_ids: list[int] = field(default_factory=list)
-    segmentation_geometry_class_ids: list[int] = field(default_factory=list)
-    segmentation_geometry_state_dim: int = 32
-    segmentation_dropout_prob: float = 0.1
 
     # Converts the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
@@ -118,6 +106,9 @@ class SegVLAConfig(PreTrainedConfig):
 
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
+
+    # Real-Time Chunking (RTC) configuration
+    rtc_config: RTCConfig | None = None
 
     def __post_init__(self):
         super().__post_init__()

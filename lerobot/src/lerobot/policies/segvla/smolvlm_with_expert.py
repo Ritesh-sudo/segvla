@@ -91,28 +91,6 @@ class SmolVLMWithExpertModel(nn.Module):
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
         self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
         self.config = config
-        vision_config = getattr(self.get_vlm_model().vision_model, "config", None)
-        if vision_config is None and hasattr(self.config, "vision_config"):
-            vision_config = self.config.vision_config
-        image_size = getattr(vision_config, "image_size", 224)
-        if isinstance(image_size, (tuple, list)):
-            image_height, image_width = image_size
-        else:
-            image_height = image_width = image_size
-        patch_size = getattr(vision_config, "patch_size", 16)
-        if isinstance(patch_size, (tuple, list)):
-            patch_height, patch_width = patch_size
-        else:
-            patch_height = patch_width = patch_size
-        self.vision_patch_shape = (max(1, image_height // patch_height), max(1, image_width // patch_width))
-        self.vision_num_patches = self.vision_patch_shape[0] * self.vision_patch_shape[1]
-        self.vision_hidden_size = int(
-            getattr(
-                vision_config,
-                "hidden_size",
-                getattr(vision_config, "embed_dim", self.get_vlm_model().vision_model.config.hidden_size),
-            )
-        )
         # Smaller lm expert
         lm_expert_config = copy.deepcopy(config.text_config)
         hidden_size = lm_expert_config.hidden_size
@@ -202,21 +180,17 @@ class SmolVLMWithExpertModel(nn.Module):
     def embed_image(self, image: torch.Tensor):
         patch_attention_mask = None
         # Get sequence from the vision encoder
-        outputs = self.get_vlm_model().vision_model(
-            pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
-            patch_attention_mask=patch_attention_mask,
-            output_hidden_states=True,
+        image_hidden_states = (
+            self.get_vlm_model()
+            .vision_model(
+                pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
+                patch_attention_mask=patch_attention_mask,
+            )
+            .last_hidden_state
         )
-        image_hidden_states = outputs.last_hidden_state
-        patch_tokens = self._strip_cls_token(image_hidden_states)
         # Modality projection & resampling
         image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
-        return image_hidden_states, patch_tokens
-
-    def _strip_cls_token(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.shape[1] == self.vision_num_patches + 1:
-            return hidden_states[:, 1:, :]
-        return hidden_states[:, : self.vision_num_patches, :]
+        return image_hidden_states
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)

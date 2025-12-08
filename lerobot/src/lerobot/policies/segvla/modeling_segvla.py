@@ -15,59 +15,67 @@
 # limitations under the License.
 
 """
-SmolVLA:
+SegVLA:
 
-[Paper](https://huggingface.co/papers/2506.01844)
+Based on SmolVLA [Paper](https://huggingface.co/papers/2506.01844) with segmentation adapter.
 
 Designed by Hugging Face.
 
-Install smolvla extra dependencies:
+Install segvla extra dependencies:
 ```bash
 pip install -e ".[smolvla]"
 ```
 
-Example of finetuning the smolvla pretrained model (`smolvla_base`):
+Example of finetuning the segvla pretrained model (`segvla_base`):
 ```bash
 lerobot-train \
---policy.path=lerobot/smolvla_base \
+--policy.path=lerobot/segvla_base \
 --dataset.repo_id=danaaubakirova/svla_so100_task1_v3 \
 --batch_size=64 \
 --steps=200000
 ```
 
-Example of finetuning a smolVLA. SmolVLA is composed of a pretrained VLM,
-and an action expert.
+Example of finetuning a SegVLA. SegVLA is composed of a pretrained VLM,
+and an action expert with segmentation adapter.
 ```bash
 lerobot-train \
---policy.type=smolvla \
+--policy.type=segvla \
 --dataset.repo_id=danaaubakirova/svla_so100_task1_v3 \
 --batch_size=64 \
 --steps=200000
 ```
 
-Example of using the smolvla pretrained model outside LeRobot training framework:
+Example of using the segvla pretrained model outside LeRobot training framework:
 ```python
-policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+policy = SegVLAPolicy.from_pretrained("lerobot/segvla_base")
 ```
 
 """
 
 import math
 from collections import deque
-from dataclasses import dataclass
+from typing import TypedDict
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
+from typing_extensions import Unpack
 
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.segvla.configuration_segvla import SegVLAConfig
-from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+from lerobot.policies.segvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.utils import (
     populate_queues,
 )
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.utils import get_safe_dtype
+
+
+class ActionSelectKwargs(TypedDict, total=False):
+    inference_delay: int | None
+    prev_chunk_left_over: Tensor | None
+    execution_horizon: int | None
 
 
 def create_sinusoidal_pos_embedding(
@@ -233,8 +241,8 @@ class SegVLAPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
-
-        self.model = VLAFlowMatching(config)
+        self.init_rtc_processor()
+        self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
 
     def reset(self):
@@ -243,10 +251,28 @@ class SegVLAPolicy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
 
+    def init_rtc_processor(self):
+        """Initialize RTC processor if RTC is enabled in config."""
+        self.rtc_processor = None
+
+        # Lets create processor if the config provided
+        # If RTC is not enabled - we still can track the denoising data
+        if self.config.rtc_config is not None:
+            self.rtc_processor = RTCProcessor(self.config.rtc_config)
+
+            # In case of calling init_rtc_processor after the model is created
+            # We need to set the rtc_processor to the model
+            # During the normal initialization process the model is not created yet
+            model_value = getattr(self, "model", None)
+            if model_value is not None:
+                model_value.rtc_processor = self.rtc_processor
+
     def get_optim_params(self) -> dict:
         return self.parameters()
 
-    def _get_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def _get_action_chunk(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor:
         # TODO: Check if this for loop is needed.
         # Context: In fact, self.queues contains only ACTION field, and in inference, we don't have action in the batch
         # In the case of offline inference, we have the action in the batch
@@ -256,13 +282,13 @@ class SegVLAPolicy(PreTrainedPolicy):
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
-        images, img_masks, seg_logits = self.prepare_images(batch)
+        images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, seg_logits, lang_tokens, lang_masks, state, noise=noise
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
 
         # Unpad actions
@@ -281,30 +307,37 @@ class SegVLAPolicy(PreTrainedPolicy):
         return batch
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def predict_action_chunk(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor:
         self.eval()
 
         batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
-        actions = self._get_action_chunk(batch, noise)
+        actions = self._get_action_chunk(batch, noise, **kwargs)
         return actions
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def select_action(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor:
         """Select a single action given environment observations.
 
         This method wraps `select_actions` in order to return one action at a time for execution in the
         environment. It works by managing the actions in a queue and only calling `select_actions` when the
         queue is empty.
         """
+
+        assert not self._rtc_enabled(), (
+            "RTC is not supported for select_action, use it with predict_action_chunk"
+        )
+
         self.eval()
         batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
-        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-        # querying the policy.
-        if len(self._queues[ACTION]) == 0:
+        if self._check_get_actions_condition():
             actions = self._get_action_chunk(batch, noise)
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
@@ -313,22 +346,26 @@ class SegVLAPolicy(PreTrainedPolicy):
 
         return self._queues[ACTION].popleft()
 
+    def _check_get_actions_condition(self) -> bool:
+        return len(self._queues[ACTION]) == 0
+
+    def _rtc_enabled(self) -> bool:
+        return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> dict[str, Tensor]:
         """Do a full training forward pass to compute the loss"""
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
-        images, img_masks, seg_logits = self.prepare_images(batch)
+        images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
-        losses = self.model.forward(
-            images, img_masks, seg_logits, lang_tokens, lang_masks, state, actions, noise, time
-        )
+        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         loss_dict["losses_after_forward"] = losses.clone()
 
         if actions_is_pad is not None:
@@ -347,12 +384,11 @@ class SegVLAPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
     def prepare_images(self, batch):
-        """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
-        convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
+        """Apply SegVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio,
+        optionally fuse with segmentation logits, and convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
         images = []
         img_masks = []
-        seg_logits = []
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
 
@@ -363,44 +399,76 @@ class SegVLAPolicy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+
+            # Check for segmentation logits if adapter is enabled
+            seg_logits = None
+            if self.config.use_segmentation_adapter and self.model.segmentation_adapter is not None:
+                seg_key = f"{key}_segmentation"
+                if seg_key in batch:
+                    # seg_logits = batch[seg_key][:, -1, :, :, :] if batch[seg_key].ndim == 5 else batch[seg_key]
+                    
+                    seg_data = batch[seg_key]
+                    # Handle temporal dimension if present
+                    if seg_data.ndim == 4:  # (B, T, H, W) - class indices with time
+                        seg_data = seg_data[:, -1, :, :]  # Take last timestep -> (B, H, W)
+                    elif seg_data.ndim == 5:  # (B, T, C, H, W) - already one-hot with time
+                        seg_data = seg_data[:, -1, :, :, :]
+
+                    # Store as class indices for now (will convert to one-hot after resize)
+                    seg_class_indices = seg_data
+
+                else:
+                    # Create dummy segmentation with zeros if not present
+                    print("Segmentation data not available")
+                    bsize, _, h, w = img.shape
+                    seg_class_indices = torch.zeros(bsize, h, w, dtype=torch.long, device=img.device)
+            else:
+                print(f"NO SEGMENTATION!!!!")
+                seg_class_indices = None
+
+            # Apply resize_with_pad to both RGB and segmentation independently
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
+                if seg_class_indices is not None:
+                    # Resize class indices using nearest neighbor interpolation
+                    # Add channel dim: (B, H, W) -> (B, 1, H, W)
+                    seg_class_indices = seg_class_indices.unsqueeze(1).float()
+                    # Resize (nearest to preserve class indices)
+                    seg_class_indices = F.interpolate(
+                        seg_class_indices,
+                        size=self.config.resize_imgs_with_padding,
+                        mode='nearest'
+                    )
+                    # Remove channel dim and convert back to long: (B, 1, H, W) -> (B, H, W)
+                    seg_class_indices = seg_class_indices.squeeze(1).long()
+
+            # Convert to one-hot AFTER resizing (more memory efficient)
+            if seg_class_indices is not None:
+                seg_logits = torch.nn.functional.one_hot(
+                    seg_class_indices,
+                    num_classes=self.config.num_segmentation_classes
+                ).permute(0, 3, 1, 2).float()  # (B, H, W, C) -> (B, C, H, W)
+            else:
+                seg_logits = None
+
+            # Apply segmentation fusion if enabled
+            if self.config.use_segmentation_adapter and self.model.segmentation_adapter is not None and seg_logits is not None:
+                # Fuse RGB with segmentation logits
+                img = self.model.segmentation_adapter(img, seg_logits)
+
+            # Normalize from range [0,1] to [-1,1] as expected by siglip
+            # Note: this is done AFTER fusion per instructions
             img = img * 2.0 - 1.0
 
             bsize = img.shape[0]
             device = img.device
-
-            # Padding masks can come from datasets as "<key>_padding_mask" or "<key>_is_pad" (True = padded).
             if f"{key}_padding_mask" in batch:
-                mask = batch[f"{key}_padding_mask"]
-            elif f"{key}_is_pad" in batch:
-                mask = ~batch[f"{key}_is_pad"]  # convert is_pad → valid-token mask
+                mask = batch[f"{key}_padding_mask"].bool()
             else:
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            mask = mask.to(device=device, dtype=torch.bool)
-
-            # If the mask still has a time/frame dimension, mirror the image selection (last frame).
-            if mask.ndim == 1 and mask.shape[0] != bsize:
-                mask = mask.view(1, -1).expand(bsize, -1)
-            if mask.ndim > 1:
-                mask = mask[:, -1]
-
-            if mask.shape[0] != bsize:
-                raise ValueError(
-                    f"Unexpected padding mask shape {mask.shape} for {key}; expected batch dimension {bsize}"
-                )
             images.append(img)
             img_masks.append(mask)
-
-            seg_key = self.config.segmentation_feature_map.get(key)
-            if seg_key is not None and seg_key in batch:
-                seg = batch[seg_key][:, -1, :, :, :] if batch[seg_key].ndim == 5 else batch[seg_key]
-                seg_logits.append(seg)
-            else:
-                seg_logits.append(None)
-                print("seg_logits is none")
 
         # Create image features not present in the batch
         # as fully 0 padded images.
@@ -411,8 +479,7 @@ class SegVLAPolicy(PreTrainedPolicy):
             mask = torch.zeros_like(mask)
             images.append(img)
             img_masks.append(mask)
-            seg_logits.append(None)
-        return images, img_masks, seg_logits
+        return images, img_masks
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -476,161 +543,78 @@ def pad_tensor(tensor, max_len, pad_value=0):
     return padded_tensor
 
 
-@dataclass
-class SegmentationCueResult:
-    tokens: torch.Tensor
-    class_ids: torch.Tensor
-    presence: torch.Tensor
-    centroids: torch.Tensor
-    areas: torch.Tensor
+class SegmentationFusionAdapter(nn.Module):
+    """
+    A 1x1 convolutional adapter that fuses RGB images with segmentation logits.
 
-    def gather_stats(self, class_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        device = self.tokens.device
-        dtype = self.tokens.dtype
-        if self.class_ids.numel() == 0:
-            zeros = torch.zeros(self.tokens.shape[0], dtype=dtype, device=device)
-            centroid = torch.zeros(self.tokens.shape[0], 2, dtype=dtype, device=device)
-            return zeros, centroid, zeros
-        mask = self.class_ids == class_id
-        if not torch.any(mask):
-            zeros = torch.zeros(self.tokens.shape[0], dtype=dtype, device=device)
-            centroid = torch.zeros(self.tokens.shape[0], 2, dtype=dtype, device=device)
-            return zeros, centroid, zeros
-        presence = torch.where(mask, self.presence, torch.zeros_like(self.presence)).sum(dim=1)
-        centroid = torch.where(mask[..., None], self.centroids, torch.zeros_like(self.centroids)).sum(dim=1)
-        areas = torch.where(mask, self.areas, torch.zeros_like(self.areas)).sum(dim=1)
-        return presence, centroid, areas
+    The adapter is initialized to be an identity operation for RGB channels,
+    allowing for gradual learning of segmentation fusion during training.
+    """
 
-
-class SegmentationCueBuilder(nn.Module):
-    def __init__(
-        self,
-        patch_shape: tuple[int, int],
-        hidden_dim: int,
-        num_classes: int,
-        max_tokens: int,
-        region_specs: tuple[tuple[float, float, float, float], ...],
-        top_k: int,
-        dropout_prob: float,
-    ):
+    def __init__(self, num_segmentation_classes=150):
         super().__init__()
-        self.patch_shape = patch_shape
-        self.hidden_dim = hidden_dim
-        self.num_classes = num_classes
-        self.max_tokens = max_tokens
-        self.region_specs = region_specs
-        self.top_k = top_k
-        self.dropout_prob = dropout_prob
-        self.num_region_tokens = len(region_specs)
-        self.num_class_slots = max(0, max_tokens - 1 - self.num_region_tokens)
+        self.num_segmentation_classes = num_segmentation_classes
 
-        patch_h, patch_w = patch_shape
-        y_coords = torch.linspace(0.0, 1.0, patch_h)
-        x_coords = torch.linspace(0.0, 1.0, patch_w)
-        grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
-        self.register_buffer("coord_x", grid_x.reshape(-1), persistent=False)
-        self.register_buffer("coord_y", grid_y.reshape(-1), persistent=False)
-
-        region_masks = []
-        for (x0, x1, y0, y1) in region_specs:
-            mask = torch.zeros(patch_h, patch_w)
-            xs = slice(int(x0 * patch_w), max(int(x1 * patch_w), int(x0 * patch_w) + 1))
-            ys = slice(int(y0 * patch_h), max(int(y1 * patch_h), int(y0 * patch_h) + 1))
-            mask[ys, xs] = 1.0
-            region_masks.append(mask.reshape(-1))
-        if region_masks:
-            self.register_buffer("region_masks", torch.stack(region_masks), persistent=False)
-        else:
-            self.register_buffer("region_masks", torch.empty(0, patch_h * patch_w), persistent=False)
-
-        self.null_tokens = nn.Parameter(torch.zeros(max_tokens, hidden_dim))
-
-    def forward(
-        self,
-        vision_tokens: torch.Tensor,
-        seg_logits: torch.Tensor | None,
-        class_ids: list[int] | None = None,
-    ) -> SegmentationCueResult | None:
-        if seg_logits is None:
-            return None
-        if self.training and self.dropout_prob > 0.0:
-            if torch.rand(1, device=vision_tokens.device).item() < self.dropout_prob:
-                return None
-
-        seg = seg_logits.to(device=vision_tokens.device, dtype=vision_tokens.dtype)
-        seg = F.interpolate(seg, size=self.patch_shape, mode="bilinear", align_corners=False)
-        seg_probs = seg.softmax(dim=1)
-        bsz, _, _, _ = seg_probs.shape
-        seg_probs = seg_probs.flatten(2)
-
-        top_k = min(self.top_k, self.num_classes)
-        mean_probs = seg_probs.mean(dim=-1)
-        topk_vals, topk_idx = mean_probs.topk(k=top_k, dim=1)
-
-        class_tokens = torch.zeros(
-            bsz, self.num_class_slots, self.hidden_dim, dtype=vision_tokens.dtype, device=vision_tokens.device
+        # 1x1 Conv: (3 RGB + num_segmentation_classes) -> 3 RGB
+        self.fusion_conv = nn.Conv2d(
+            in_channels=3 + num_segmentation_classes,
+            out_channels=3,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=True
         )
-        selected_ids = torch.full(
-            (bsz, self.num_class_slots), -1, dtype=torch.long, device=vision_tokens.device
-        )
-        presence = torch.zeros(bsz, self.num_class_slots, dtype=vision_tokens.dtype, device=vision_tokens.device)
-        centroids = torch.zeros(bsz, self.num_class_slots, 2, dtype=vision_tokens.dtype, device=vision_tokens.device)
-        areas = torch.zeros_like(presence)
 
-        additional_ids = class_ids or []
-        for b in range(bsz):
-            chosen = topk_idx[b].tolist()
-            for cid in additional_ids:
-                if 0 <= cid < self.num_classes and cid not in chosen:
-                    chosen.append(cid)
-            chosen = chosen[: self.num_class_slots]
-            for slot, class_id in enumerate(chosen):
-                weights = seg_probs[b, class_id]
-                alpha = torch.softmax(weights, dim=0)
-                token = torch.sum(alpha[:, None] * vision_tokens[b], dim=0)
-                total = weights.sum() + 1e-6
-                cx = torch.sum(weights * self.coord_x) / total
-                cy = torch.sum(weights * self.coord_y) / total
-                class_tokens[b, slot] = token
-                selected_ids[b, slot] = class_id
-                presence[b, slot] = weights.mean()
-                centroids[b, slot, 0] = cx
-                centroids[b, slot, 1] = cy
-                areas[b, slot] = weights.mean()
+        # Initialize weights for zero-init strategy
+        self._initialize_weights()
 
-        global_token = vision_tokens.mean(dim=1, keepdim=True)
-        region_tokens = []
-        for mask in self.region_masks:
-            norm = mask.sum()
-            if norm <= 0:
-                continue
-            weights = mask / norm
-            token = torch.sum(vision_tokens * weights[None, :, None], dim=1, keepdim=True)
-            region_tokens.append(token)
-        if region_tokens:
-            region_tokens = torch.cat(region_tokens, dim=1)
-        else:
-            region_tokens = torch.zeros(
-                bsz, 0, self.hidden_dim, dtype=vision_tokens.dtype, device=vision_tokens.device
-            )
+    def _initialize_weights(self):
+        """
+        Initialize the adapter weights:
+        - RGB channels: Identity mapping
+        - Segmentation channels: Zero weights
+        - Bias: Zero
 
-        token_parts = [global_token, class_tokens]
-        if isinstance(region_tokens, torch.Tensor) and region_tokens.numel() > 0:
-            token_parts.append(region_tokens)
-        tokens = torch.cat(token_parts, dim=1)
-        if tokens.shape[1] < self.max_tokens:
-            pad = self.null_tokens[: self.max_tokens - tokens.shape[1]][None, :, :].to(tokens.dtype)
-            tokens = torch.cat([tokens, pad.expand(bsz, -1, -1)], dim=1)
-        elif tokens.shape[1] > self.max_tokens:
-            tokens = tokens[:, : self.max_tokens]
+        This ensures the adapter initially outputs the original RGB image.
+        """
+        with torch.no_grad():
+            # Initialize all weights to zero first
+            self.fusion_conv.weight.zero_()
 
-        return SegmentationCueResult(tokens=tokens, class_ids=selected_ids, presence=presence, centroids=centroids, areas=areas)
+            # Set RGB weights to identity (first 3 input channels -> 3 output channels)
+            for i in range(3):
+                self.fusion_conv.weight[i, i] = 1.0
+
+            # Segmentation weights remain zero (already set)
+            # Set bias to zero
+            if self.fusion_conv.bias is not None:
+                self.fusion_conv.bias.zero_()
+
+    def forward(self, rgb_image, segmentation_logits):
+        """
+        Fuse RGB image with segmentation logits.
+
+        Args:
+            rgb_image: Tensor of shape (B, 3, H, W)
+            segmentation_logits: Tensor of shape (B, num_classes, H, W)
+
+        Returns:
+            fused_image: Tensor of shape (B, 3, H, W)
+        """
+        # Concatenate along channel dimension
+        combined = torch.cat([rgb_image, segmentation_logits], dim=1)  # (B, 3+num_classes, H, W)
+
+        # Apply 1x1 convolution for fusion
+        fused_image = self.fusion_conv(combined)  # (B, 3, H, W)
+
+        return fused_image
+
 
 class VLAFlowMatching(nn.Module):
     """
-    SmolVLA
+    SegVLA with segmentation adapter
 
-    [Paper]()
+    Based on SmolVLA
 
     Designed by Hugging Face.
     ┌──────────────────────────────┐
@@ -652,9 +636,18 @@ class VLAFlowMatching(nn.Module):
     └──────────────────────────────┘
     """
 
-    def __init__(self, config: SegVLAConfig):
+    def __init__(self, config: SegVLAConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
+
+        # Initialize segmentation adapter if enabled
+        self.segmentation_adapter = None
+        if self.config.use_segmentation_adapter:
+            self.segmentation_adapter = SegmentationFusionAdapter(
+                num_segmentation_classes=self.config.num_segmentation_classes
+            )
+        else:
+            print("NO SEG!!")
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
@@ -666,7 +659,6 @@ class VLAFlowMatching(nn.Module):
             num_vlm_layers=self.config.num_vlm_layers,
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
-            device=self.config.device,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -681,34 +673,6 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
-        if self.config.segmentation_feature_map:
-            self.segmentation_builder = SegmentationCueBuilder(
-                patch_shape=self.vlm_with_expert.vision_patch_shape,
-                hidden_dim=self.vlm_with_expert.vision_hidden_size,
-                num_classes=self.config.segmentation_num_classes,
-                max_tokens=self.config.segmentation_max_tokens,
-                region_specs=self.config.segmentation_region_specs,
-                top_k=self.config.segmentation_top_k_classes,
-                dropout_prob=self.config.segmentation_dropout_prob,
-            )
-            text_hidden = self.vlm_with_expert.config.text_config.hidden_size
-            expert_hidden = self.vlm_with_expert.expert_hidden_size
-            self.segmentation_token_proj = nn.Linear(self.vlm_with_expert.vision_hidden_size, text_hidden)
-            self.segmentation_state_proj = nn.Linear(self.config.segmentation_geometry_state_dim, text_hidden)
-            self.segmentation_context_proj = nn.Linear(self.vlm_with_expert.vision_hidden_size, expert_hidden)
-            self.segmentation_time_fuser = nn.Sequential(
-                nn.Linear(expert_hidden * 2, expert_hidden),
-                nn.SiLU(),
-                nn.Linear(expert_hidden, expert_hidden),
-                nn.LayerNorm(expert_hidden),
-            )
-        else:
-            self.segmentation_builder = None
-            self.segmentation_token_proj = None
-            self.segmentation_state_proj = None
-            self.segmentation_context_proj = None
-            self.segmentation_time_fuser = None
-
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
@@ -719,6 +683,10 @@ class VLAFlowMatching(nn.Module):
         self.add_image_special_tokens = self.config.add_image_special_tokens
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
+        self.rtc_processor = rtc_processor
+
+    def _rtc_enabled(self):
+        return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -741,25 +709,18 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, seg_logits, lang_tokens, lang_masks, state: torch.Tensor = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor | None]]:
+        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
         """
-        target_bsize = images[0].shape[0]
-
-        embs: list[torch.Tensor] = []
-        emb_names: list[str] = []
+        embs = []
         pad_masks = []
         att_masks = []
-        seg_context_tokens = []
-        geometry_candidates: list[torch.Tensor] = []
-
         for _img_idx, (
             img,
             img_mask,
-            seg_logit,
-        ) in enumerate(zip(images, img_masks, seg_logits, strict=False)):
+        ) in enumerate(zip(images, img_masks, strict=False)):
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -773,10 +734,9 @@ class VLAFlowMatching(nn.Module):
                 )
                 att_masks += [0] * (image_start_mask.shape[-1])
                 embs.append(image_start_token)
-                emb_names.append(f"{key}_img_start")
                 pad_masks.append(image_start_mask)
 
-            img_emb, patch_tokens = self.vlm_with_expert.embed_image(img)
+            img_emb = self.vlm_with_expert.embed_image(img)
             img_emb = img_emb
 
             # Normalize image embeddings
@@ -784,48 +744,12 @@ class VLAFlowMatching(nn.Module):
             img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
 
             bsize, num_img_embs = img_emb.shape[:2]
-            img_mask = img_mask.to(device=img_emb.device, dtype=torch.bool)
-
-            # Squeeze/reshape any extra dims (e.g., [B, T], [T], [T, 1])
-            if img_mask.ndim > 1:
-                img_mask = img_mask.reshape(img_mask.shape[0], -1)
-                if img_mask.shape[0] == bsize:
-                    img_mask = img_mask[:, -1]
-                else:
-                    img_mask = img_mask.flatten()
-
-            # Align to batch dimension, broadcasting if mask is frame-only.
-            if img_mask.ndim == 1 and img_mask.shape[0] != bsize:
-                if img_mask.numel() == 1:
-                    img_mask = img_mask.expand(bsize)
-                elif img_mask.shape[0] < bsize:
-                    img_mask = img_mask.view(1, -1).expand(bsize, -1)[:, -1]
-                else:
-                    img_mask = img_mask[:bsize]
-
-            if img_mask.shape[0] != bsize:
-                raise ValueError(f"Image mask shape {img_mask.shape} does not match batch size {bsize}.")
-
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
 
             embs.append(img_emb)
-            emb_names.append(f"{key}_img")
             pad_masks.append(img_mask)
- 
+
             att_masks += [0] * (num_img_embs)
-            if self.segmentation_builder is not None and seg_logit is not None:
-                seg_result = self.segmentation_builder(patch_tokens, seg_logit, self.config.segmentation_task_class_ids)
-                if seg_result is not None:
-                    seg_tokens = self.segmentation_token_proj(seg_result.tokens)
-                    seg_mask = img_mask[:, :1].expand(bsize, seg_tokens.shape[1])
-                    embs.append(seg_tokens)
-                    emb_names.append(f"{key}_seg")
-                    pad_masks.append(seg_mask)
-                    att_masks += [0] * seg_tokens.shape[1]
-                    seg_context_tokens.append(seg_result.tokens)
-                    geom = self._build_geometry_features(seg_result)
-                    if geom is not None:
-                        geometry_candidates.append(geom)
             if self.add_image_special_tokens:
                 image_end_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -838,31 +762,14 @@ class VLAFlowMatching(nn.Module):
                     image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
                 )
                 embs.append(image_end_token)
-                emb_names.append(f"{key}_img_end")
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
-        # Normalize language tensors to match the image batch size.
-        if lang_tokens.ndim == 1:
-            lang_tokens = lang_tokens[None, :]
-        if lang_masks.ndim == 1:
-            lang_masks = lang_masks[None, :]
-        if lang_tokens.shape[0] != target_bsize or lang_masks.shape[0] != target_bsize:
-            if lang_tokens.shape[0] == 1 and lang_masks.shape[0] == 1:
-                lang_tokens = lang_tokens.expand(target_bsize, -1)
-                lang_masks = lang_masks.expand(target_bsize, -1)
-            else:
-                raise ValueError(
-                    f"Language batch size mismatch: tokens {lang_tokens.shape}, masks {lang_masks.shape}, "
-                    f"expected {target_bsize} (image batch)."
-                )
-
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
         embs.append(lang_emb)
-        emb_names.append("lang")
         pad_masks.append(lang_masks)
 
         num_lang_embs = lang_emb.shape[1]
@@ -871,48 +778,15 @@ class VLAFlowMatching(nn.Module):
         state_emb = self.state_proj(state)
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
         embs.append(state_emb)
-        emb_names.append("state")
         bsize = state_emb.shape[0]
         device = state_emb.device
 
         states_seq_len = state_emb.shape[1]
         state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
         pad_masks.append(state_mask)
+
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
-
-        geometry = self._aggregate_geometry_vectors(
-            geometry_candidates, device=state_emb.device, dtype=state_emb.dtype
-        )
-        if geometry is not None and self.segmentation_state_proj is not None:
-            geom_emb = self.segmentation_state_proj(geometry)
-            geom_emb = geom_emb[:, None, :]
-            geom_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
-            embs.append(geom_emb)
-            emb_names.append("geom")
-            pad_masks.append(geom_mask)
-            att_masks += [1]
-
-        # Ensure all embeddings are 3D (B, T, D) before concatenation.
-        bsize_ref = None
-        for idx, emb in enumerate(embs):
-            if emb.ndim == 2:
-                emb = emb[:, None, :]
-            elif emb.ndim != 3:
-                raise ValueError(
-                    f"Unexpected embedding rank {emb.ndim} at index {idx} ({emb_names[idx]}), shape {emb.shape}"
-                )
-
-            if bsize_ref is None:
-                bsize_ref = emb.shape[0]
-            elif emb.shape[0] != bsize_ref:
-                shapes = [(name, e.shape) for name, e in zip(emb_names, embs)]
-                raise ValueError(
-                    f"Embedding batch mismatch: expected {bsize_ref}, got {emb.shape[0]} "
-                    f"at index {idx} ({emb_names[idx]}). All shapes: {shapes}"
-                )
-            embs[idx] = emb
-
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -925,48 +799,10 @@ class VLAFlowMatching(nn.Module):
             att_masks = pad_tensor(att_masks, self.prefix_length, pad_value=0)
 
         att_masks = att_masks.expand(bsize, -1)
-        seg_context = torch.cat(seg_context_tokens, dim=1) if seg_context_tokens else None
-        seg_metadata = {"context_tokens": seg_context, "geometry": geometry}
 
-        return embs, pad_masks, att_masks, seg_metadata
+        return embs, pad_masks, att_masks
 
-    def _build_geometry_features(self, seg_result: SegmentationCueResult) -> torch.Tensor | None:
-        if not self.config.segmentation_geometry_class_ids:
-            return None
-        device = seg_result.tokens.device
-        dtype = seg_result.tokens.dtype
-        geom_dim = self.config.segmentation_geometry_state_dim
-        geom = torch.zeros(seg_result.tokens.shape[0], geom_dim, device=device, dtype=dtype)
-        offset = 0
-        centroids = []
-        for class_id in self.config.segmentation_geometry_class_ids:
-            presence, centroid, area = seg_result.gather_stats(class_id)
-            values = torch.stack([presence, centroid[:, 0], centroid[:, 1], area], dim=1)
-            end = min(offset + 4, geom_dim)
-            geom[:, offset:end] = values[:, : end - offset]
-            offset = end
-            centroids.append(centroid)
-            if offset >= geom_dim:
-                break
-        if len(centroids) >= 2 and offset + 5 <= geom_dim:
-            dx = centroids[0][:, 0] - centroids[1][:, 0]
-            dy = centroids[0][:, 1] - centroids[1][:, 1]
-            dist = torch.sqrt(dx**2 + dy**2 + 1e-6)
-            angle = torch.atan2(dy, dx)
-            rel = torch.stack([dx, dy, dist, torch.sin(angle), torch.cos(angle)], dim=1)
-            geom[:, offset : offset + rel.shape[1]] = rel[:, : geom_dim - offset]
-        return geom
-
-    def _aggregate_geometry_vectors(
-        self, geometry_candidates: list[torch.Tensor], device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor | None:
-        valid = [g for g in geometry_candidates if g is not None]
-        if not valid:
-            return None
-        stacked = torch.stack(valid, dim=0)
-        return stacked.mean(dim=0).to(dtype=dtype, device=device)
-
-    def embed_suffix(self, noisy_actions, timestep, seg_context: torch.Tensor | None = None):
+    def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -988,19 +824,6 @@ class VLAFlowMatching(nn.Module):
         time_emb = time_emb.type(dtype=dtype)
 
         time_emb = time_emb[:, None, :].expand_as(action_emb)
-        if (
-            seg_context is not None
-            and self.segmentation_context_proj is not None
-            and self.segmentation_time_fuser is not None
-        ):
-            seg_vec = seg_context.mean(dim=1)
-            seg_vec = self.segmentation_context_proj(seg_vec)
-            if self.training and self.config.segmentation_dropout_prob > 0:
-                drop_mask = torch.rand(seg_vec.shape[0], device=device) < self.config.segmentation_dropout_prob
-                seg_vec = torch.where(drop_mask[:, None], torch.zeros_like(seg_vec), seg_vec)
-            seg_vec = seg_vec[:, None, :].expand_as(action_emb)
-            fused = torch.cat([time_emb, seg_vec], dim=2)
-            time_emb = self.segmentation_time_fuser(fused)
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
         action_time_emb = self.action_time_mlp_in(action_time_emb)
@@ -1023,7 +846,7 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, seg_logits, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -1035,12 +858,10 @@ class VLAFlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        prefix_embs, prefix_pad_masks, prefix_att_masks, seg_metadata = self.embed_prefix(
-            images, img_masks, seg_logits, lang_tokens, lang_masks, state=state
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            x_t, time, seg_metadata.get("context_tokens")
-        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -1062,7 +883,16 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
-    def sample_actions(self, images, img_masks, seg_logits, lang_tokens, lang_masks, state, noise=None) -> Tensor:
+    def sample_actions(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
         device = state.device
@@ -1071,12 +901,9 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        (
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-            seg_metadata,
-        ) = self.embed_prefix(images, img_masks, seg_logits, lang_tokens, lang_masks, state=state)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
@@ -1093,19 +920,45 @@ class VLAFlowMatching(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        seg_context = seg_metadata.get("context_tokens") if isinstance(seg_metadata, dict) else None
+
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-                seg_context,
-            )
+
+            # Define a closure function to properly capture expanded_time
+            # This avoids the lambda expression (E731) and loop variable binding (B023) issues
+            def denoise_step_partial_call(input_x_t, current_timestep=expanded_time):
+                return self.denoise_step(
+                    x_t=input_x_t,
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    timestep=current_timestep,
+                )
+
+            if self._rtc_enabled():
+                inference_delay = kwargs.get("inference_delay")
+                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                execution_horizon = kwargs.get("execution_horizon")
+
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=time,
+                    original_denoise_step_partial=denoise_step_partial_call,
+                    execution_horizon=execution_horizon,
+                )
+            else:
+                v_t = denoise_step_partial_call(x_t)
+
             # Euler step
             x_t += dt * v_t
+
+            # Record x_t and v_t after Euler step (other params are recorded in rtc_processor.denoise_step)
+            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
             time += dt
+
         return x_t
 
     def denoise_step(
@@ -1114,10 +967,9 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
-        seg_context: torch.Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep, seg_context)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
