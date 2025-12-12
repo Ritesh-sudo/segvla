@@ -418,10 +418,8 @@ class SegVLAPolicy(PreTrainedPolicy):
                     seg_class_indices = seg_data
 
                 else:
-                    # Create dummy segmentation with zeros if not present
-                    print("Segmentation data not available")
-                    bsize, _, h, w = img.shape
-                    seg_class_indices = torch.zeros(bsize, h, w, dtype=torch.long, device=img.device)
+                    # Compute segmentation on-the-fly during evaluation
+                    seg_class_indices = self.model._compute_segmentation(img)
             else:
                 print(f"NO SEGMENTATION!!!!")
                 seg_class_indices = None
@@ -649,6 +647,10 @@ class VLAFlowMatching(nn.Module):
         else:
             print("NO SEG!!")
 
+        # Lazy-loaded segmentation model for runtime inference (evaluation)
+        self._seg_model = None
+        self._seg_processor = None
+
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
@@ -687,6 +689,48 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _get_segmentation_model(self):
+        """Lazy-load the segmentation model for runtime inference during evaluation."""
+        if self._seg_model is None:
+            from transformers import AutoImageProcessor, AutoModelForUniversalSegmentation
+
+            model_id = "facebook/mask2former-swin-large-ade-semantic"
+            self._seg_processor = AutoImageProcessor.from_pretrained(model_id)
+            # Get device from the VLM model
+            device = next(self.vlm_with_expert.parameters()).device
+            self._seg_model = AutoModelForUniversalSegmentation.from_pretrained(
+                model_id, torch_dtype=torch.float16
+            ).to(device)
+            self._seg_model.eval()
+        return self._seg_processor, self._seg_model
+
+    def _compute_segmentation(self, img_tensor):
+        """
+        Compute segmentation for a batch of images during runtime.
+
+        Args:
+            img_tensor: (B, 3, H, W) float tensor in [0, 1] range
+
+        Returns:
+            seg_class_indices: (B, H, W) long tensor with class indices
+        """
+        processor, model = self._get_segmentation_model()
+
+        # Convert to numpy images for the processor
+        # img_tensor is (B, C, H, W) in [0, 1], need to convert to uint8 numpy (B, H, W, C)
+        imgs_np = (img_tensor * 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+
+        inputs = processor(images=list(imgs_np), return_tensors="pt").to(model.device)
+
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+            outputs = model(**inputs)
+
+        target_sizes = [(imgs_np.shape[1], imgs_np.shape[2])] * imgs_np.shape[0]
+        seg_maps = processor.post_process_semantic_segmentation(outputs, target_sizes=target_sizes)
+        seg_maps = torch.stack(seg_maps, dim=0).to(img_tensor.device)
+
+        return seg_maps
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():

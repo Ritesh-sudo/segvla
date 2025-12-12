@@ -1,4 +1,6 @@
 # Byte-compiled / cache
+
+lerobot/tests/*
 __pycache__/
 *.py[cod]
 *$py.class
