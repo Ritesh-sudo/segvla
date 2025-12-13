@@ -8,11 +8,12 @@
 conda create -y -n lerobot python=3.10
 conda activate lerobot
 conda install ffmpeg -c conda-forge
+conda install -c huggingface transformers
+pip install num2words
 
 git clone https://github.com/ishandotsh/segvla.git
-
-cd lerobot
-pip install -e .
+cd segvla/lerobot
+pip install -e ".[libero]"
 ```
 
 2. Train SegVLA
@@ -24,6 +25,9 @@ replace `ishandotsh/segvla_libero_m2f_10k` with your own
 the eval_* and env* options can be removed for training
 
 ```bash
+
+mkdir outputs
+
 lerobot-train \
   --policy.type=segvla \
   --dataset.repo_id=ishandotsh/libero_10_with_m2f_seg \
@@ -45,6 +49,9 @@ lerobot-train \
 This will run eval on our trained model
 
 ```bash
+
+mkdir eval_logs
+
 python src/lerobot/scripts/lerobot_eval.py \
   --output_dir=./eval_logs/segvla_10k   \
   --env.type=libero   \
